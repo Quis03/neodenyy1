@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Build artifacts
+*.elf
+*.bin
+*.hex
+*.map
+*.o
+*.a
+*.d
+
+# IDE
+.clangd
+compile_commands.json
+
+# Temporary files
+*.tmp
+*.bak

@@ -49,11 +49,20 @@
 #define	DMA_BUF_SIZE	4096
 #define	MAX_GCODE_LEN	256
 
+/* Upper bound for the 'Q' modifier, so a typo can't block the loop. */
+#define	MAX_DURATION_MS	10000
+
 static uint8_t dma_buffer[DMA_BUF_SIZE];
 static uint8_t cmd_buffer[MAX_GCODE_LEN];
 static int cmd_buffer_ptr;
+static int cmd_buffer_ovf;
 
-static void
+/*
+ * The gcode_command_*() helpers print their own "error: ..." line and
+ * return non-zero on failure, in which case COMPLETE is not sent.
+ */
+
+static int
 gcode_command_sensor_read(struct gcode_command *cmd)
 {
 	int val;
@@ -64,61 +73,156 @@ gcode_command_sensor_read(struct gcode_command *cmd)
 	} else if (cmd->sensor_read_target == 2) {
 		val = pin_get(&gpio_sc, PORT_D, 4) ? 0 : 1;
 		printf("ok W:%d\n", val);
+	} else {
+		printf("error: unknown sensor\n");
+		return (-1);
+	}
+
+	return (0);
+}
+
+/*
+ * mdx_usleep() longer than about a second rounds up to the next second
+ * (16 bit timer), so sleep in shorter slices.
+ */
+static void
+gcode_sleep_ms(int ms)
+{
+	int chunk;
+
+	while (ms > 0) {
+		chunk = ms > 500 ? 500 : ms;
+		mdx_usleep(chunk * 1000);
+		ms -= chunk;
 	}
 }
 
-static void
-gcode_command_actuate(struct gcode_command *cmd)
+static int
+gcode_actuate_needle(int val)
 {
 	int cur;
+
+	cur = pin_get(&gpio_sc, PORT_B, 5);
+	if (cur && val) {
+		printf("error: needle already set\n");
+		return (-1);
+	}
+
+	if (!cur && !val) {
+		printf("error: needle already cleared\n");
+		return (-1);
+	}
+
+	pin_set(&gpio_sc, PORT_E, 0, val);
+	mdx_usleep(150000);
+
+	if (val == 0) {
+		/* Ensure it is not set. */
+		do {
+			cur = pin_get(&gpio_sc, PORT_B, 5);
+			if (cur == 0)
+				break;
+			mdx_usleep(25000);
+		} while (1);
+	}
+
+	return (0);
+}
+
+static int
+gcode_command_actuate(struct gcode_command *cmd)
+{
+	int error;
 	int val;
 
-	val = cmd->actuate_value ? 1 : 0;
+	error = 0;
 
-	switch (cmd->actuate_target) {
-	case PNP_ACTUATE_TARGET_PUMP:
-		pin_set(&gpio_sc, PORT_B, 13, val);
+	if (cmd->actuate_mask & (1 << PNP_ACT_PUMP)) {
+		pin_set(&gpio_sc, PORT_B, 13,
+		    cmd->actuate_value[PNP_ACT_PUMP]);
 		mdx_usleep(250000);
-		break;
-	case PNP_ACTUATE_TARGET_AVAC1:
-		pin_set(&gpio_sc, PORT_E, 2, val);
-		mdx_usleep(250000);
-		break;
-	case PNP_ACTUATE_TARGET_AVAC2:
-		pin_set(&gpio_sc, PORT_E, 1, val);
-		mdx_usleep(250000);
-		break;
-	case PNP_ACTUATE_TARGET_NEEDLE:
-		cur = pin_get(&gpio_sc, PORT_B, 5);
-		if (cur && val) {
-			printf("ERR: needle already set\n");
-		} else if (!cur && !val) {
-			printf("ERR: needle already cleared\n");
-		} else {
-			pin_set(&gpio_sc, PORT_E, 0, val);
-			mdx_usleep(150000);
+	}
 
-			if (val == 0) {
-				/* Ensure it is not set. */
-				do {
-					cur = pin_get(&gpio_sc, PORT_B, 5);
-					if (cur == 0)
-						break;
-					mdx_usleep(25000);
-				} while (1);
-			}
-		}
+	if (cmd->actuate_mask & (1 << PNP_ACT_AVAC1)) {
+		pin_set(&gpio_sc, PORT_E, 2,
+		    cmd->actuate_value[PNP_ACT_AVAC1]);
+		mdx_usleep(250000);
+	}
 
-		break;
-	case PNP_ACTUATE_TARGET_PEEL:
-		pin_set(&gpio_sc, PORT_B, 12, val); /* Peel L */
-		pin_set(&gpio_sc, PORT_B, 11, val); /* Peel R */
+	if (cmd->actuate_mask & (1 << PNP_ACT_AVAC2)) {
+		pin_set(&gpio_sc, PORT_E, 1,
+		    cmd->actuate_value[PNP_ACT_AVAC2]);
+		mdx_usleep(250000);
+	}
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_NEEDLE)) {
+		error = gcode_actuate_needle(cmd->actuate_value[
+		    PNP_ACT_NEEDLE]);
+		if (error)
+			return (error);
+	}
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_PEEL_L)) {
+		val = cmd->actuate_value[PNP_ACT_PEEL_L];
+		pin_set(&gpio_sc, PORT_B, 12, val);
 		if (val)
 			mdx_usleep(250000);
-		break;
-	default:
-		break;
 	}
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_PEEL_R)) {
+		val = cmd->actuate_value[PNP_ACT_PEEL_R];
+		pin_set(&gpio_sc, PORT_B, 11, val);
+		if (val)
+			mdx_usleep(250000);
+	}
+
+	/* PD5 is the top ring, PC10 the bottom one. */
+	if (cmd->actuate_mask & (1 << PNP_ACT_LED_TOP))
+		pin_set(&gpio_sc, PORT_D, 5,
+		    cmd->actuate_value[PNP_ACT_LED_TOP]);
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_LED_BOTTOM))
+		pin_set(&gpio_sc, PORT_C, 10,
+		    cmd->actuate_value[PNP_ACT_LED_BOTTOM]);
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_VIBRATOR)) {
+		val = cmd->actuate_value[PNP_ACT_VIBRATOR];
+		pin_set(&gpio_sc, PORT_A, 3, val);
+		if (val && cmd->duration_ms) {
+			gcode_sleep_ms(cmd->duration_ms);
+			pin_set(&gpio_sc, PORT_A, 3, 0);
+		}
+	}
+
+	return (error);
+}
+
+static void
+gcode_set_actuator(struct gcode_command *cmd, int target, float value)
+{
+
+	cmd->actuate_mask |= (1 << target);
+	cmd->actuate_value[target] = value ? 1 : 0;
+}
+
+/* Clamp before converting to int. NaN lands on the lower bound. */
+static float
+gcode_clamp(float value, float min, float max)
+{
+
+	if (!(value >= min))
+		return (min);
+	if (!(value <= max))
+		return (max);
+
+	return (value);
+}
+
+static int
+gcode_coord_nm(float value)
+{
+
+	return (gcode_clamp(value, -1000.0f, 1000.0f) * 1000000);
 }
 
 static void
@@ -129,6 +233,7 @@ gcode_command(char *line, int len)
 	char *endp;
 	char *end;
 	float value;
+	int error;
 
 #ifdef GCODE_DEBUG
 	int i;
@@ -145,29 +250,36 @@ gcode_command(char *line, int len)
 		letter = *line;
 
 		/* Skip spaces. */
-		if (letter == ' ') {
+		if (letter == ' ' || letter == '\t') {
 			line += 1;
 			continue;
 		}
 
-		if (letter < 'A' || letter > 'Z') {
-			printf("%s: Error: expected a letter.\n", __func__);
+		/* Rest of the line is a comment. */
+		if (letter == ';')
 			break;
+
+		if (letter < 'A' || letter > 'Z') {
+			printf("error: bad gcode\n");
+			return;
 		}
 
 		/* Skip letter. */
 		line += 1;
 
 		/* Ensure we are dealing with digit, + or -. */
-		if ((*line < '0' || *line > '9') &&
+		if (line == end ||
+		    ((*line < '0' || *line > '9') &&
 		    (*line != '+') &&
-		    (*line != '-'))
-			break;
+		    (*line != '-'))) {
+			printf("error: bad gcode\n");
+			return;
+		}
 
 		value = strtof(line, &endp);
 		line = endp;
 
-		printf("%s: value %.3f\n", __func__, value);
+		dprintf("%s: value %.3f\n", __func__, value);
 
 		switch (letter) {
 		case 'M':
@@ -175,83 +287,115 @@ gcode_command(char *line, int len)
 				cmd.type = CMD_TYPE_ACTUATE;
 			else if (value == 105.0f)
 				cmd.type = CMD_TYPE_SENSOR_READ;
+			else if (value == 114.0f)
+				cmd.type = CMD_TYPE_POS_REPORT;
 			break;
 		case 'G':
 			if (value == 0.0f) /* Linear move. */
 				cmd.type = CMD_TYPE_MOVE;
+			else if (value == 28.0f) /* Home. */
+				cmd.type = CMD_TYPE_HOME;
 			break;
 		case 'X':
-			cmd.x = value * 1000000;
+			cmd.x = gcode_coord_nm(value);
 			cmd.x_set = 1;
 			break;
 		case 'Y':
-			cmd.y = value * 1000000;
+			cmd.y = gcode_coord_nm(value);
 			cmd.y_set = 1;
 			break;
 		case 'Z':
-			cmd.z = value * 1000000;
+			cmd.z = gcode_coord_nm(value);
 			cmd.z_set = 1;
 			break;
 		case 'I':
-			cmd.h1 = value * 1000000;
+			cmd.h1 = gcode_coord_nm(value);
 			cmd.h1_set = 1;
 			break;
 		case 'J':
-			cmd.h2 = value * 1000000;
+			cmd.h2 = gcode_coord_nm(value);
 			cmd.h2_set = 1;
 			break;
 		case 'P':
-			cmd.actuate_target |= PNP_ACTUATE_TARGET_PUMP;
-			cmd.actuate_value = value;
+			gcode_set_actuator(&cmd, PNP_ACT_PUMP, value);
 			break;
 		case 'V':
 			/* Air vacuum 1 */
-			cmd.actuate_target |= PNP_ACTUATE_TARGET_AVAC1;
-			cmd.actuate_value = value;
+			gcode_set_actuator(&cmd, PNP_ACT_AVAC1, value);
 			break;
 		case 'W':
 			/* Air vacuum 2 */
-			cmd.actuate_target |= PNP_ACTUATE_TARGET_AVAC2;
-			cmd.actuate_value = value;
+			gcode_set_actuator(&cmd, PNP_ACT_AVAC2, value);
 			break;
 		case 'N':
 			/* Air vac sensors read. */
-			cmd.sensor_read_target = value;
+			cmd.sensor_read_target = gcode_clamp(value, 0.0f, 9.0f);
 			break;
 		case 'D':
 			/* Needle */
-			cmd.actuate_target |= PNP_ACTUATE_TARGET_NEEDLE;
-			cmd.actuate_value = value;
+			gcode_set_actuator(&cmd, PNP_ACT_NEEDLE, value);
 			break;
-		case 'O':
-			/* Peel */
-			cmd.actuate_target |= PNP_ACTUATE_TARGET_PEEL;
-			cmd.actuate_value = value;
+		case 'L':
+			/* Peel, left bank. */
+			gcode_set_actuator(&cmd, PNP_ACT_PEEL_L, value);
+			break;
+		case 'R':
+			/* Peel, right bank. */
+			gcode_set_actuator(&cmd, PNP_ACT_PEEL_R, value);
+			break;
+		case 'T':
+			/* Top (down-looking) camera LED ring. */
+			gcode_set_actuator(&cmd, PNP_ACT_LED_TOP, value);
+			break;
+		case 'B':
+			/* Bottom (up-looking) camera LED ring. */
+			gcode_set_actuator(&cmd, PNP_ACT_LED_BOTTOM, value);
+			break;
+		case 'S':
+			/* Vibrator (stick / bulk feeder). */
+			gcode_set_actuator(&cmd, PNP_ACT_VIBRATOR, value);
+			break;
+		case 'Q':
+			/* Actuation length, milliseconds. */
+			cmd.duration_ms = gcode_clamp(value, 0.0f,
+			    (float)MAX_DURATION_MS);
 			break;
 		case 'F':
+			/* Feed rate, mm per minute. */
+			cmd.f = gcode_clamp(value, 0.0f, 1000000.0f);
+			cmd.f_set = 1;
 			break;
 		default:
+			dprintf("%s: ignoring letter %c\n", __func__, letter);
 			break;
 		}
 	}
 
-	/* Acknowledge the command. */
-	printf("OK\n");
-
 	switch (cmd.type) {
 	case CMD_TYPE_MOVE:
-		pnp_command_move(&cmd);
+		error = pnp_command_move(&cmd);
 		break;
 	case CMD_TYPE_ACTUATE:
-		gcode_command_actuate(&cmd);
+		error = gcode_command_actuate(&cmd);
 		break;
 	case CMD_TYPE_SENSOR_READ:
-		gcode_command_sensor_read(&cmd);
+		error = gcode_command_sensor_read(&cmd);
+		break;
+	case CMD_TYPE_HOME:
+		error = pnp_home_all();
+		break;
+	case CMD_TYPE_POS_REPORT:
+		error = pnp_report_position();
+		break;
+	default:
+		/* Nothing we act on. Still a well formed line. */
+		error = 0;
 		break;
 	};
 
-	/* TODO: check for errors. */
-	printf("COMPLETE\n");
+	/* A failed command has already printed its error line. */
+	if (error == 0)
+		printf("COMPLETE\n");
 }
 
 static void
@@ -265,12 +409,33 @@ gcode_process_data(int ptr, int len)
 	for (i = 0; i < len; i++) {
 		ch = start[i];
 		dprintf("ch %d\n", ch);
-		cmd_buffer[cmd_buffer_ptr] = ch;
+
+		/* Tolerate CRLF line endings. */
+		if (ch == '\r')
+			continue;
+
 		if (ch == '\n') { /* LF */
-			gcode_command(cmd_buffer, cmd_buffer_ptr);
+			if (cmd_buffer_ovf) {
+				printf("error: line too long\n");
+				cmd_buffer_ovf = 0;
+			} else if (cmd_buffer_ptr > 0) {
+				/* strtof() needs the terminator. */
+				cmd_buffer[cmd_buffer_ptr] = '\0';
+				gcode_command((char *)cmd_buffer,
+				    cmd_buffer_ptr);
+			}
 			cmd_buffer_ptr = 0;
-		} else
-			cmd_buffer_ptr += 1;
+			continue;
+		}
+
+		/* Drop the rest of an oversized line, keep room for NUL. */
+		if (cmd_buffer_ptr == MAX_GCODE_LEN - 1) {
+			cmd_buffer_ovf = 1;
+			continue;
+		}
+
+		cmd_buffer[cmd_buffer_ptr] = ch;
+		cmd_buffer_ptr += 1;
 	}
 }
 
@@ -301,6 +466,7 @@ gcode_mainloop(void)
 
 	ptr = 0;
 	cmd_buffer_ptr = 0;
+	cmd_buffer_ovf = 0;
 
 	gcode_dmarecv_init();
 

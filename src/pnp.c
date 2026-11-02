@@ -77,6 +77,32 @@
 #define	PNP_STEPS_H_MIN		(-180000000 / PNP_NR_STEP_DEG)
 #define	PNP_STEPS_H_MAX		(180000000 / PNP_NR_STEP_DEG)
 
+/*
+ * Speed. A step is 400 ticks of the timer, so the step rate is
+ * speed * 375 Hz on X and Y, and speed * 125 Hz on Z and the nozzles.
+ * The frequency must stay below the 84 MHz timer clock, or the
+ * prescaler wraps around.
+ */
+#define	PNP_XY_FREQ_MUL		150000
+#define	PNP_ZH_FREQ_MUL		50000
+#define	PNP_TIMER_FREQ		84000000
+#define	PNP_SPEED_MIN		1
+#define	PNP_SPEED_MAX_XY	(PNP_TIMER_FREQ / 2 / PNP_XY_FREQ_MUL)
+#define	PNP_SPEED_MAX_ZH	(PNP_TIMER_FREQ / 2 / PNP_ZH_FREQ_MUL)
+#define	PNP_SPEED_DEFAULT	100
+#define	PNP_SPEED_RAMP_MIN	15
+
+/*
+ * Feed rate conversion, speed = F * f_num / f_den with F in mm/min.
+ * X, Y: 160 steps/mm at 375 steps/s per unit of speed.
+ * Z: sized on the steepest point of the cam (135.8 steps/mm at 90 deg),
+ * so Z is never faster than asked.
+ */
+#define	PNP_XY_F_NUM		8
+#define	PNP_XY_F_DEN		1125
+#define	PNP_Z_F_NUM		181
+#define	PNP_Z_F_DEN		10000
+
 struct move_task {
 	int steps;
 	int check_home;
@@ -84,6 +110,9 @@ struct move_task {
 	int speed;
 	mdx_sem_t task_compl_sem;
 	int speed_control;
+
+	/* Target position, committed to the motor when the move starts. */
+	int pos_nm;
 
 	/* Result */
 	int home_found;
@@ -94,6 +123,7 @@ struct motor_state {
 	mdx_sem_t worker_sem;
 	struct move_task task;
 	const char *name;
+	const char *axis;	/* GCode letter, for error and position reports. */
 	void (*set_direction)(int dir);
 	int (*is_at_home)(void);
 	void (*step)(int chanset, int speed);
@@ -109,6 +139,17 @@ struct motor_state {
 	 */
 	int steps;
 
+	/*
+	 * Last position moved to, in nanometers. Used to report Z, whose
+	 * steps are cam degrees.
+	 */
+	int pos_nm;
+
+	/* Feed rate to speed conversion. Zero f_den means F is ignored. */
+	int f_num;
+	int f_den;
+	int speed_max;
+
 	/* Limits. */
 	int steps_max;
 	int steps_min;
@@ -120,6 +161,9 @@ struct pnp_state {
 	struct motor_state motor_z;
 	struct motor_state motor_h1;
 	struct motor_state motor_h2;
+
+	/* Moves are refused until homing has succeeded. */
+	int homed;
 };
 
 static struct pnp_state pnp;
@@ -284,12 +328,24 @@ pnp_zset_direction(int dir)
 	pin_set(&gpio_sc, PORT_E, 3, dir); /* Z FR */
 }
 
+static uint32_t
+pnp_step_freq(int speed, int mul, int max)
+{
+
+	if (speed < PNP_SPEED_MIN)
+		speed = PNP_SPEED_MIN;
+	if (speed > max)
+		speed = max;
+
+	return ((uint32_t)speed * mul);
+}
+
 static void
 xstep(int chanset, int speed)
 {
 	uint32_t freq;
 
-	freq = speed * 150000;
+	freq = pnp_step_freq(speed, PNP_XY_FREQ_MUL, PNP_SPEED_MAX_XY);
 
 	stm32f4_pwm_step(&pwm_x_sc, chanset, freq);
 }
@@ -299,7 +355,7 @@ ystep(int chanset, int speed)
 {
 	uint32_t freq;
 
-	freq = speed * 150000;
+	freq = pnp_step_freq(speed, PNP_XY_FREQ_MUL, PNP_SPEED_MAX_XY);
 
 	stm32f4_pwm_step(&pwm_y_sc, chanset, freq);
 }
@@ -309,7 +365,7 @@ zstep(int chanset, int speed)
 {
 	uint32_t freq;
 
-	freq = speed * 50000;
+	freq = pnp_step_freq(speed, PNP_ZH_FREQ_MUL, PNP_SPEED_MAX_ZH);
 
 	stm32f4_pwm_step(&pwm_z_sc, chanset, freq);
 }
@@ -319,7 +375,7 @@ h1step(int chanset, int speed)
 {
 	uint32_t freq;
 
-	freq = speed * 50000;
+	freq = pnp_step_freq(speed, PNP_ZH_FREQ_MUL, PNP_SPEED_MAX_ZH);
 
 	stm32f4_pwm_step(&pwm_h1_sc, chanset, freq);
 }
@@ -329,23 +385,51 @@ h2step(int chanset, int speed)
 {
 	uint32_t freq;
 
-	freq = speed * 50000;
+	freq = pnp_step_freq(speed, PNP_ZH_FREQ_MUL, PNP_SPEED_MAX_ZH);
 
 	stm32f4_pwm_step(&pwm_h2_sc, chanset, freq);
 }
 
 static int
-calc_speed(int i, int steps, int speed)
+calc_speed(int i, int steps, int target)
 {
+	int speed;
 	int t;
 
 	t = i < (steps - i) ? i : (steps - i);
-	if (t < 1000) {
-		/* Gradually increase/decrease speed */
-		speed = t / 10;
-		if (speed < 15)
-			speed = 15;
-	}
+	if (t >= 1000)
+		return (target);
+
+	/* Gradually increase/decrease speed */
+	speed = t / 10;
+	if (speed < PNP_SPEED_RAMP_MIN)
+		speed = PNP_SPEED_RAMP_MIN;
+
+	/* Never ramp past the requested speed. */
+	if (speed > target)
+		speed = target;
+
+	return (speed);
+}
+
+/*
+ * Convert a feed rate in mm/min into this motor's speed unit. The
+ * nozzle rotations have no conversion and run at the default speed.
+ */
+static int
+pnp_speed_from_f(struct motor_state *motor, struct gcode_command *cmd)
+{
+	int speed;
+
+	if (!cmd->f_set || motor->f_den == 0 || cmd->f <= 0)
+		return (PNP_SPEED_DEFAULT);
+
+	speed = cmd->f * motor->f_num / motor->f_den;
+
+	if (speed < PNP_SPEED_MIN)
+		speed = PNP_SPEED_MIN;
+	if (speed > motor->speed_max)
+		speed = motor->speed_max;
 
 	return (speed);
 }
@@ -356,6 +440,7 @@ pnp_worker_thread(void *arg)
 	struct motor_state *motor;
 	struct move_task *task;
 	uint32_t steps;
+	int target;
 	int speed;
 	int i;
 
@@ -367,7 +452,8 @@ pnp_worker_thread(void *arg)
 		dprintf("%s: task rcvd\n", __func__);
 
 		steps = task->steps;
-		speed = task->speed;
+		target = task->speed;
+		speed = target;
 
 		dprintf("%s: steps needed %d\n", __func__, steps);
 
@@ -380,7 +466,7 @@ pnp_worker_thread(void *arg)
 			}
 
 			if (task->speed_control)
-				speed = calc_speed(i, steps, speed);
+				speed = calc_speed(i, steps, target);
 
 			motor->step(motor->chanset, speed);
 			mdx_sem_wait(&motor->step_sem);
@@ -395,53 +481,88 @@ pnp_worker_thread(void *arg)
 	}
 }
 
+#define	PNP_ERR_TRANSLATE	1
+#define	PNP_ERR_LIMITS		2
+
+/*
+ * Validate a move and stage it on the motor's task without starting it,
+ * so that a multi axis G0 is refused as a whole.
+ */
 static int
-pnp_move_nonblock(struct motor_state *motor, int new_pos)
+pnp_move_prepare(struct motor_state *motor, int new_pos, int speed)
 {
 	struct move_task *task;
-	uint32_t delta;
 	int new_steps;
+	int target;
 	int error;
 	int tmp;
 
 	task = &motor->task;
-	task->check_home = 0;
-	task->speed_control = 1;
+	target = new_pos;
 
 	/* Convert required position from mm to degrees if needed. */
 	if (motor->cam_translate_mm_to_deg) {
 		if (motor->cam_radius == 0)
-			return (-1);
+			return (PNP_ERR_TRANSLATE);
 		error = motor->cam_translate_mm_to_deg(new_pos,
 		    motor->cam_radius, &tmp);
-		if (error) {
-			printf("Error: can't translate coordinate\n");
-			return (-2);
-		}
+		if (error)
+			return (PNP_ERR_TRANSLATE);
 		new_pos = tmp;
 	}
 
 	new_steps = new_pos / motor->step_nm;
 	if (new_steps > motor->steps_max ||
-	    new_steps < motor->steps_min) {
-		printf("Can't move due to limits\n");
-		return (-3);
-	}
+	    new_steps < motor->steps_min)
+		return (PNP_ERR_LIMITS);
+
+	task->check_home = 0;
+	task->speed_control = 1;
+	task->speed = speed;
 
 	if (new_steps > motor->steps) {
 		task->direction = 1;
-		delta = abs(new_steps - motor->steps);
+		task->steps = new_steps - motor->steps;
 	} else {
 		task->direction = 0;
-		delta = abs(motor->steps - new_steps);
+		task->steps = motor->steps - new_steps;
 	}
 
-	task->steps = delta;
-	task->speed = 100;
-
-	mdx_sem_post(&motor->worker_sem);
+	task->pos_nm = target;
 
 	return (0);
+}
+
+static void
+pnp_move_error(struct motor_state *motor, int error)
+{
+
+	switch (error) {
+	case PNP_ERR_TRANSLATE:
+		printf("error: cannot translate %s coordinate\n", motor->axis);
+		break;
+	case PNP_ERR_LIMITS:
+		printf("error: %s out of range\n", motor->axis);
+		break;
+	default:
+		printf("error: %s move failed\n", motor->axis);
+		break;
+	}
+}
+
+static void
+pnp_move_start(struct motor_state *motor)
+{
+
+	motor->pos_nm = motor->task.pos_nm;
+	mdx_sem_post(&motor->worker_sem);
+}
+
+static void
+pnp_move_wait(struct motor_state *motor)
+{
+
+	mdx_sem_wait(&motor->task.task_compl_sem);
 }
 
 static int
@@ -449,16 +570,42 @@ pnp_move(struct motor_state *motor, int new_pos)
 {
 	int error;
 
-	error = pnp_move_nonblock(motor, new_pos);
+	error = pnp_move_prepare(motor, new_pos, PNP_SPEED_DEFAULT);
 	if (error)
 		return (error);
 
-	mdx_sem_wait(&motor->task.task_compl_sem);
+	pnp_move_start(motor);
+	pnp_move_wait(motor);
 
 	return (0);
 }
 
-static void
+static int
+pnp_move_xy(int new_pos_x, int new_pos_y)
+{
+	int error;
+
+	error = pnp_move_prepare(&pnp.motor_x, new_pos_x, PNP_SPEED_DEFAULT);
+	if (error)
+		return (error);
+
+	error = pnp_move_prepare(&pnp.motor_y, new_pos_y, PNP_SPEED_DEFAULT);
+	if (error)
+		return (error);
+
+	pnp_move_start(&pnp.motor_x);
+	pnp_move_start(&pnp.motor_y);
+
+	pnp_move_wait(&pnp.motor_x);
+	pnp_move_wait(&pnp.motor_y);
+
+	dprintf("%s: new pos %d %d\n", __func__, pnp.motor_x.steps,
+	    pnp.motor_y.steps);
+
+	return (0);
+}
+
+static int
 pnp_move_home_motor(struct motor_state *motor)
 {
 	struct move_task *task;
@@ -476,8 +623,10 @@ pnp_move_home_motor(struct motor_state *motor)
 		mdx_sem_wait(&task->task_compl_sem);
 	}
 
-	if (motor->is_at_home() == 0)
-		panic("we are still not at home");
+	if (motor->is_at_home() == 0) {
+		printf("error: %s home switch not reached\n", motor->axis);
+		return (-1);
+	}
 
 	/* Now move back a bit. */
 	task->direction = 1;
@@ -488,12 +637,14 @@ pnp_move_home_motor(struct motor_state *motor)
 	mdx_sem_post(&motor->worker_sem);
 	mdx_sem_wait(&task->task_compl_sem);
 
-	if (motor->is_at_home())
-		panic("still at home");
+	if (motor->is_at_home()) {
+		printf("error: %s home switch stuck\n", motor->axis);
+		return (-2);
+	}
 
 	/* Now try to reach home slowly. */
 
-	printf("%s is trying to reach home\n", motor->name);
+	dprintf("%s is trying to reach home\n", motor->name);
 	task->steps = PNP_MAX_Y_NM / motor->step_nm;
 	task->check_home = 1;
 	task->speed = 2;
@@ -502,9 +653,14 @@ pnp_move_home_motor(struct motor_state *motor)
 	mdx_sem_post(&motor->worker_sem);
 	mdx_sem_wait(&task->task_compl_sem);
 
+	if (motor->is_at_home() == 0) {
+		printf("error: %s home switch not reached\n", motor->axis);
+		return (-1);
+	}
+
 	/* Now go into home for 1 mm. */
 
-	printf("%s is going into home for 1mm\n", motor->name);
+	dprintf("%s is going into home for 1mm\n", motor->name);
 	task->steps = 1000000 / motor->step_nm;
 	task->check_home = 0;
 	task->speed = 2;
@@ -514,7 +670,10 @@ pnp_move_home_motor(struct motor_state *motor)
 	mdx_sem_wait(&task->task_compl_sem);
 
 	motor->steps = 0;
-	printf("%s home reached\n", motor->name);
+	motor->pos_nm = 0;
+	dprintf("%s home reached\n", motor->name);
+
+	return (0);
 }
 
 static int
@@ -545,8 +704,11 @@ pnp_move_home_z(struct motor_state *motor)
 	dir = 1;
 	found = 0;
 
-	/* Now find home once again. */
-	for (i = 0; i < 20; i++) {
+	/*
+	 * Search with a growing oscillation around the start position.
+	 * 40 sweeps cover the whole +/-111 deg cam range.
+	 */
+	for (i = 0; i < 40; i++) {
 		printf("Making %d steps towards %d\n", steps, dir);
 		task->direction = dir;
 		task->steps = steps;
@@ -565,7 +727,7 @@ pnp_move_home_z(struct motor_state *motor)
 	}
 
 	if (found == 0) {
-		printf("Error: Z Home not found\n");
+		printf("error: Z home switch not found\n");
 		return (-1);
 	}
 
@@ -580,81 +742,196 @@ pnp_move_home_z(struct motor_state *motor)
 	mdx_sem_wait(&task->task_compl_sem);
 
 	motor->steps = 0;
-	printf("Z home found\n");
+	motor->pos_nm = 0;
+	dprintf("Z home found\n");
 
 	return (0);
 }
 
+/*
+ * Home every axis. Safe to run more than once (G28): after homing the Y
+ * origin is moved to the far end and its direction inverted, so that is
+ * undone first.
+ */
 static int
-pnp_move_home(void)
+pnp_home_axes(void)
 {
 	int error;
+
+	pnp.homed = 0;
+	pnp.motor_y.set_direction = pnp_yset_direction;
+
+	/* Bring the nozzle rotations back to their tracked zero. */
+	error = pnp_move(&pnp.motor_h1, 0);
+	if (error == 0)
+		error = pnp_move(&pnp.motor_h2, 0);
+	if (error) {
+		printf("error: cannot rotate nozzles to zero\n");
+		return (error);
+	}
 
 	error = pnp_move_home_z(&pnp.motor_z);
 	if (error)
 		return (error);
 
-	pnp_move_home_motor(&pnp.motor_y);
-	pnp_move_home_motor(&pnp.motor_x);
+	error = pnp_move_home_motor(&pnp.motor_y);
+	if (error)
+		return (error);
+
+	error = pnp_move_home_motor(&pnp.motor_x);
+	if (error)
+		return (error);
+
+	/* Change location of 0,0. */
+	error = pnp_move_xy(0, PNP_MAX_Y_NM);
+	if (error) {
+		printf("error: cannot reach the Y origin\n");
+		return (error);
+	}
+
+	pnp.motor_y.steps = 0;
+	pnp.motor_y.pos_nm = 0;
+	pnp.motor_y.set_direction = pnp_yset_direction_rev;
+
+	pnp.homed = 1;
 
 	return (0);
 }
 
-void
+int
+pnp_home_all(void)
+{
+
+	return (pnp_home_axes());
+}
+
+int
 pnp_command_move(struct gcode_command *cmd)
 {
-	uint32_t x, y, z, h1, h2;
+	struct motor_state *started[4];
+	int nstarted;
+	int error;
+	int i;
 
-	/* TODO: check for errors. */
+	if (pnp.homed == 0) {
+		printf("error: machine not homed\n");
+		return (-1);
+	}
 
+	/* Validate every axis before any of them moves. */
 	if (cmd->x_set) {
-		x = cmd->x;
-		printf("moving X to %d\n", x);
-		pnp_move_nonblock(&pnp.motor_x, x);
+		error = pnp_move_prepare(&pnp.motor_x, cmd->x,
+		    pnp_speed_from_f(&pnp.motor_x, cmd));
+		if (error) {
+			pnp_move_error(&pnp.motor_x, error);
+			return (error);
+		}
 	}
 
 	if (cmd->y_set) {
-		y = cmd->y;
-		printf("moving Y to %d\n", y);
-		pnp_move_nonblock(&pnp.motor_y, y);
+		error = pnp_move_prepare(&pnp.motor_y, cmd->y,
+		    pnp_speed_from_f(&pnp.motor_y, cmd));
+		if (error) {
+			pnp_move_error(&pnp.motor_y, error);
+			return (error);
+		}
 	}
 
 	if (cmd->h1_set) {
-		h1 = -1 * cmd->h1;
-		printf("moving H1 to %d\n", h1);
-		pnp_move_nonblock(&pnp.motor_h1, h1);
+		error = pnp_move_prepare(&pnp.motor_h1, -1 * cmd->h1,
+		    pnp_speed_from_f(&pnp.motor_h1, cmd));
+		if (error) {
+			pnp_move_error(&pnp.motor_h1, error);
+			return (error);
+		}
 	}
 
 	if (cmd->h2_set) {
-		h2 = -1 * cmd->h2;
-		printf("moving H2 to %d\n", h2);
-		/* TODO: check for errors. */
-		pnp_move_nonblock(&pnp.motor_h2, h2);
+		error = pnp_move_prepare(&pnp.motor_h2, -1 * cmd->h2,
+		    pnp_speed_from_f(&pnp.motor_h2, cmd));
+		if (error) {
+			pnp_move_error(&pnp.motor_h2, error);
+			return (error);
+		}
 	}
-
-	if (cmd->h1_set)
-		mdx_sem_wait(&pnp.motor_h1.task.task_compl_sem);
-	if (cmd->h2_set)
-		mdx_sem_wait(&pnp.motor_h2.task.task_compl_sem);
-	if (cmd->x_set)
-		mdx_sem_wait(&pnp.motor_x.task.task_compl_sem);
-	if (cmd->y_set)
-		mdx_sem_wait(&pnp.motor_y.task.task_compl_sem);
 
 	if (cmd->z_set) {
-		z = cmd->z;
-		printf("moving Z to %d\n", z);
-		pnp_move(&pnp.motor_z, z);
+		error = pnp_move_prepare(&pnp.motor_z, cmd->z,
+		    pnp_speed_from_f(&pnp.motor_z, cmd));
+		if (error) {
+			pnp_move_error(&pnp.motor_z, error);
+			return (error);
+		}
 	}
+
+	/* Z goes last, once the head has arrived. */
+	nstarted = 0;
+
+	if (cmd->x_set) {
+		dprintf("moving X to %d\n", cmd->x);
+		pnp_move_start(&pnp.motor_x);
+		started[nstarted++] = &pnp.motor_x;
+	}
+
+	if (cmd->y_set) {
+		dprintf("moving Y to %d\n", cmd->y);
+		pnp_move_start(&pnp.motor_y);
+		started[nstarted++] = &pnp.motor_y;
+	}
+
+	if (cmd->h1_set) {
+		dprintf("moving H1 to %d\n", -1 * cmd->h1);
+		pnp_move_start(&pnp.motor_h1);
+		started[nstarted++] = &pnp.motor_h1;
+	}
+
+	if (cmd->h2_set) {
+		dprintf("moving H2 to %d\n", -1 * cmd->h2);
+		pnp_move_start(&pnp.motor_h2);
+		started[nstarted++] = &pnp.motor_h2;
+	}
+
+	for (i = 0; i < nstarted; i++)
+		pnp_move_wait(started[i]);
+
+	if (cmd->z_set) {
+		dprintf("moving Z to %d\n", cmd->z);
+		pnp_move_start(&pnp.motor_z);
+		pnp_move_wait(&pnp.motor_z);
+	}
+
+	return (0);
+}
+
+int
+pnp_report_position(void)
+{
+	float x, y, z, h1, h2;
+
+	x = (float)pnp.motor_x.steps * pnp.motor_x.step_nm / 1000000.0f;
+	y = (float)pnp.motor_y.steps * pnp.motor_y.step_nm / 1000000.0f;
+
+	/* Z steps are cam degrees. */
+	z = (float)pnp.motor_z.pos_nm / 1000000.0f;
+
+	/* The rotations are negated on the way in. */
+	h1 = -(float)pnp.motor_h1.steps * pnp.motor_h1.step_nm / 1000000.0f;
+	h2 = -(float)pnp.motor_h2.steps * pnp.motor_h2.step_nm / 1000000.0f;
+
+	printf("ok X:%.4f Y:%.4f Z:%.4f I:%.4f J:%.4f\n", x, y, z, h1, h2);
+
+	return (0);
 }
 
 static void
-pnp_motor_initialize(struct motor_state *motor, const char *name)
+pnp_motor_initialize(struct motor_state *motor, const char *name,
+    const char *axis)
 {
 
 	mdx_sem_init(&motor->worker_sem, 0);
 	mdx_sem_init(&motor->step_sem, 0);
 	motor->name = name;
+	motor->axis = axis;
 }
 
 static int
@@ -681,7 +958,7 @@ pnp_initialize(void)
 
 	bzero(&pnp, sizeof(struct pnp_state));
 
-	pnp_motor_initialize(&pnp.motor_x, "X Motor");
+	pnp_motor_initialize(&pnp.motor_x, "X Motor", "X");
 	pnp.motor_x.step_nm = PNP_XY_STEP_NM;
 	pnp.motor_x.set_direction = pnp_xset_direction;
 	pnp.motor_x.step = xstep;
@@ -689,9 +966,12 @@ pnp_initialize(void)
 	pnp.motor_x.is_at_home = pnp_is_x_home;
 	pnp.motor_x.steps_min = PNP_STEPS_X_MIN;
 	pnp.motor_x.steps_max = PNP_STEPS_X_MAX;
+	pnp.motor_x.f_num = PNP_XY_F_NUM;
+	pnp.motor_x.f_den = PNP_XY_F_DEN;
+	pnp.motor_x.speed_max = PNP_SPEED_MAX_XY;
 	mdx_sem_init(&pnp.motor_x.task.task_compl_sem, 0);
 
-	pnp_motor_initialize(&pnp.motor_y, "Y Motor");
+	pnp_motor_initialize(&pnp.motor_y, "Y Motor", "Y");
 	pnp.motor_y.step_nm = PNP_XY_STEP_NM;
 	pnp.motor_y.set_direction = pnp_yset_direction;
 	pnp.motor_y.step = ystep;
@@ -699,9 +979,12 @@ pnp_initialize(void)
 	pnp.motor_y.is_at_home = pnp_is_yl_home;
 	pnp.motor_y.steps_min = PNP_STEPS_Y_MIN;
 	pnp.motor_y.steps_max = PNP_STEPS_Y_MAX;
+	pnp.motor_y.f_num = PNP_XY_F_NUM;
+	pnp.motor_y.f_den = PNP_XY_F_DEN;
+	pnp.motor_y.speed_max = PNP_SPEED_MAX_XY;
 	mdx_sem_init(&pnp.motor_y.task.task_compl_sem, 0);
 
-	pnp_motor_initialize(&pnp.motor_z, "Z Motor");
+	pnp_motor_initialize(&pnp.motor_z, "Z Motor", "Z");
 	pnp.motor_z.step_nm = PNP_Z_STEP_DEG;
 	pnp.motor_z.set_direction = pnp_zset_direction;
 	pnp.motor_z.step = zstep;
@@ -711,9 +994,12 @@ pnp_initialize(void)
 	pnp.motor_z.cam_radius = CAM_RADIUS;
 	pnp.motor_z.steps_min = PNP_STEPS_Z_MIN;
 	pnp.motor_z.steps_max = PNP_STEPS_Z_MAX;
+	pnp.motor_z.f_num = PNP_Z_F_NUM;
+	pnp.motor_z.f_den = PNP_Z_F_DEN;
+	pnp.motor_z.speed_max = PNP_SPEED_MAX_ZH;
 	mdx_sem_init(&pnp.motor_z.task.task_compl_sem, 0);
 
-	pnp_motor_initialize(&pnp.motor_h1, "H1 Motor");
+	pnp_motor_initialize(&pnp.motor_h1, "H1 Motor", "I");
 	pnp.motor_h1.step_nm = PNP_NR_STEP_DEG;
 	pnp.motor_h1.set_direction = pnp_h1set_direction;
 	pnp.motor_h1.step = h1step;
@@ -721,9 +1007,10 @@ pnp_initialize(void)
 	pnp.motor_h1.is_at_home = NULL;
 	pnp.motor_h1.steps_min = PNP_STEPS_H_MIN;
 	pnp.motor_h1.steps_max = PNP_STEPS_H_MAX;
+	pnp.motor_h1.speed_max = PNP_SPEED_MAX_ZH;
 	mdx_sem_init(&pnp.motor_h1.task.task_compl_sem, 0);
 
-	pnp_motor_initialize(&pnp.motor_h2, "H2 Motor");
+	pnp_motor_initialize(&pnp.motor_h2, "H2 Motor", "J");
 	pnp.motor_h2.step_nm = PNP_NR_STEP_DEG;
 	pnp.motor_h2.set_direction = pnp_h2set_direction;
 	pnp.motor_h2.step = h2step;
@@ -731,6 +1018,7 @@ pnp_initialize(void)
 	pnp.motor_h2.is_at_home = NULL;
 	pnp.motor_h2.steps_min = PNP_STEPS_H_MIN;
 	pnp.motor_h2.steps_max = PNP_STEPS_H_MAX;
+	pnp.motor_h2.speed_max = PNP_SPEED_MAX_ZH;
 	mdx_sem_init(&pnp.motor_h2.task.task_compl_sem, 0);
 
 	error = pnp_thread_create("X Motor", &pnp.motor_x);
@@ -803,23 +1091,7 @@ pnp_test_heads(void)
 	printf("head moving done\n");
 }
 
-static int
-pnp_move_xy(uint32_t new_pos_x, uint32_t new_pos_y)
-{
-
-	pnp_move_nonblock(&pnp.motor_x, new_pos_x);
-	pnp_move_nonblock(&pnp.motor_y, new_pos_y);
-
-	mdx_sem_wait(&pnp.motor_x.task.task_compl_sem);
-	mdx_sem_wait(&pnp.motor_y.task.task_compl_sem);
-
-	dprintf("%s: new pos %d %d\n", __func__, pnp.motor_x.pos,
-	    pnp.motor_y.pos);
-
-	return (0);
-}
-
-static void
+static void __unused
 pnp_move_random(void)
 {
 	uint32_t new_x;
@@ -866,21 +1138,17 @@ pnp_main(void)
 	int error;
 
 	pnp_initialize();
-	pnp_test_heads();
-	if (1 == 0)
+
+	if (1 == 0) {
+		pnp_test_heads();
 		pnp_test_z();
-
-	error = pnp_move_home();
-	if (error)
-		return (error);
-
-	/* Change location of 0,0. */
-	pnp_move_xy(0, PNP_MAX_Y_NM);
-	pnp.motor_y.steps = 0;
-	pnp.motor_y.set_direction = pnp_yset_direction_rev;
-
-	if (1 == 0)
 		pnp_move_random();
+	}
+
+	/* Enter the GCode loop anyway, so that G28 can be retried. */
+	error = pnp_home_all();
+	if (error)
+		printf("error: homing failed\n");
 
 	gcode_mainloop();
 	pnp_deinitialize();

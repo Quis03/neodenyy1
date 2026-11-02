@@ -34,7 +34,9 @@ void pnp_pwm_h1_intr(void *arg, int irq);
 void pnp_pwm_h2_intr(void *arg, int irq);
 
 int pnp_main(void);
-void pnp_command_move(struct gcode_command *cmd);
+int pnp_command_move(struct gcode_command *cmd);
+int pnp_home_all(void);
+int pnp_report_position(void);
 void pnp_henable(int enable);
 
 #endif /* !_SRC_PNP_H_ */

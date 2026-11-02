@@ -51,6 +51,10 @@ static const struct gpio_pin neodenyy1_pins[] = {
 	/* Head 2 has component. */
 	{ PORT_D, 4, MODE_INP, 0, PULLDOWN }, /* S2 */
 
+	/* Camera LED rings. */
+	{ PORT_C, 10, MODE_OUT, 0, PULLDOWN }, /* Bottom camera LED */
+	{ PORT_D,  5, MODE_OUT, 0, PULLDOWN }, /* Top camera LED */
+
 	{ PORT_A, 3, MODE_OUT, 0, PULLDOWN }, /* Vibrator */
 	{ PORT_B, 11, MODE_OUT, 0, PULLDOWN }, /* PeelR */
 	{ PORT_B, 12, MODE_OUT, 0, PULLDOWN }, /* PeelL */

@@ -32,6 +32,8 @@ struct gcode_command {
 #define	CMD_TYPE_MOVE		1
 #define	CMD_TYPE_ACTUATE	2
 #define	CMD_TYPE_SENSOR_READ	3
+#define	CMD_TYPE_HOME		4
+#define	CMD_TYPE_POS_REPORT	5
 
 	int x;
 	int y;
@@ -44,13 +46,25 @@ struct gcode_command {
 	int h1_set;
 	int h2_set;
 
-	int actuate_target;
-#define	PNP_ACTUATE_TARGET_PUMP		1
-#define	PNP_ACTUATE_TARGET_AVAC1	2
-#define	PNP_ACTUATE_TARGET_AVAC2	3
-#define	PNP_ACTUATE_TARGET_NEEDLE	4
-#define	PNP_ACTUATE_TARGET_PEEL		5
-	int actuate_value;
+	int f;		/* Feed rate, mm per minute. */
+	int f_set;
+
+	/* Actuators: one bit and one value per target. */
+	int actuate_mask;
+#define	PNP_ACT_PUMP		0
+#define	PNP_ACT_AVAC1		1
+#define	PNP_ACT_AVAC2		2
+#define	PNP_ACT_NEEDLE		3
+#define	PNP_ACT_PEEL_L		4
+#define	PNP_ACT_PEEL_R		5
+#define	PNP_ACT_LED_TOP		6
+#define	PNP_ACT_LED_BOTTOM	7
+#define	PNP_ACT_VIBRATOR	8
+#define	PNP_ACT_NTARGETS	9
+	int actuate_value[PNP_ACT_NTARGETS];
+
+	/* 'Q': switch on, wait, switch off. Vibrator only. */
+	int duration_ms;
 
 	int sensor_read_target;
 };

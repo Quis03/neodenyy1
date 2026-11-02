@@ -164,6 +164,11 @@ struct pnp_state {
 
 	/* Moves are refused until homing has succeeded. */
 	int homed;
+
+	/* Nozzle rotation driver power, PNP_H_* reasons. */
+	int h_reason;
+	int h_idle_ms;
+	int h_force_idle_ms;
 };
 
 static struct pnp_state pnp;
@@ -267,7 +272,30 @@ pnp_zenable(int enable)
 	mdx_usleep(10000);
 }
 
-void
+/*
+ * Nozzle rotation drivers. Both heads share one Vref, so they are
+ * powered together, and left on they overheat the head. They are only
+ * energised while at least one reason holds:
+ *
+ *	PNP_H_VAC1/2	the vacuum valve of that nozzle is open.
+ *	PNP_H_HOLD	a rotation was commanded. Released by G28, M800 E0
+ *			or PNP_H_IDLE_MS of idle console.
+ *	PNP_H_FORCE	M800 E1. Released by M800 E0 or PNP_H_FORCE_IDLE_MS
+ *			of idle console. Keeps the angle while the nozzle is
+ *			still down after the valve closed on a place.
+ *
+ * The rotations have no home switch: an angle lost while the drivers
+ * are off is never recovered.
+ */
+#define	PNP_H_VAC1	(1 << 0)
+#define	PNP_H_VAC2	(1 << 1)
+#define	PNP_H_HOLD	(1 << 2)
+#define	PNP_H_FORCE	(1 << 3)
+
+#define	PNP_H_IDLE_MS		60000
+#define	PNP_H_FORCE_IDLE_MS	300000
+
+static void
 pnp_henable(int enable)
 {
 
@@ -276,6 +304,79 @@ pnp_henable(int enable)
 	pin_set(&gpio_sc, PORT_D, 3, enable); /* H1 ST */
 	pin_set(&gpio_sc, PORT_A, 15, enable); /* H2 ST */
 	mdx_usleep(10000);
+}
+
+/* Set or clear a reason, and switch the drivers if the total changed. */
+static void
+pnp_hreason(int reason, int on)
+{
+	int was;
+
+	was = pnp.h_reason;
+
+	if (on)
+		pnp.h_reason |= reason;
+	else
+		pnp.h_reason &= ~reason;
+
+	if ((was != 0) != (pnp.h_reason != 0))
+		pnp_henable(pnp.h_reason != 0);
+}
+
+static void
+pnp_hhold(void)
+{
+
+	pnp.h_idle_ms = PNP_H_IDLE_MS;
+	pnp_hreason(PNP_H_HOLD, 1);
+}
+
+/*
+ * Called from the GCode loop while no command is running, so the
+ * timeouts only count idle time.
+ */
+void
+pnp_htick(int ms)
+{
+
+	if (pnp.h_reason & PNP_H_HOLD) {
+		if (pnp.h_idle_ms > ms)
+			pnp.h_idle_ms -= ms;
+		else {
+			pnp.h_idle_ms = 0;
+			pnp_hreason(PNP_H_HOLD, 0);
+		}
+	}
+
+	if (pnp.h_reason & PNP_H_FORCE) {
+		if (pnp.h_force_idle_ms > ms)
+			pnp.h_force_idle_ms -= ms;
+		else {
+			pnp.h_force_idle_ms = 0;
+			pnp_hreason(PNP_H_FORCE, 0);
+		}
+	}
+}
+
+void
+pnp_hvacuum(int nozzle, int on)
+{
+
+	pnp_hreason(nozzle == 1 ? PNP_H_VAC1 : PNP_H_VAC2, on);
+}
+
+/* M800 E. E0 leaves the valve reasons alone. */
+void
+pnp_hforce(int on)
+{
+
+	if (on) {
+		pnp.h_force_idle_ms = PNP_H_FORCE_IDLE_MS;
+		pnp_hreason(PNP_H_FORCE, 1);
+		return;
+	}
+
+	pnp_hreason(PNP_H_FORCE | PNP_H_HOLD, 0);
 }
 
 static void
@@ -762,6 +863,7 @@ pnp_home_axes(void)
 	pnp.motor_y.set_direction = pnp_yset_direction;
 
 	/* Bring the nozzle rotations back to their tracked zero. */
+	pnp_hhold();
 	error = pnp_move(&pnp.motor_h1, 0);
 	if (error == 0)
 		error = pnp_move(&pnp.motor_h2, 0);
@@ -801,8 +903,12 @@ pnp_home_axes(void)
 int
 pnp_home_all(void)
 {
+	int error;
 
-	return (pnp_home_axes());
+	error = pnp_home_axes();
+	pnp_hreason(PNP_H_HOLD, 0);
+
+	return (error);
 }
 
 int
@@ -865,6 +971,9 @@ pnp_command_move(struct gcode_command *cmd)
 	}
 
 	/* Z goes last, once the head has arrived. */
+	if (cmd->h1_set || cmd->h2_set)
+		pnp_hhold();
+
 	nstarted = 0;
 
 	if (cmd->x_set) {
@@ -1054,7 +1163,7 @@ pnp_initialize(void)
 	pnp_xenable(1);
 	pnp_yenable(1);
 	pnp_zenable(1);
-	pnp_henable(1);
+	pnp_henable(0);
 
 	return (0);
 }
@@ -1066,7 +1175,7 @@ pnp_deinitialize(void)
 	pnp_xenable(0);
 	pnp_yenable(0);
 	pnp_zenable(0);
-	pnp_henable(0);
+	pnp_hforce(0);
 }
 
 static void
@@ -1075,6 +1184,7 @@ pnp_test_heads(void)
 	int i;
 
 	printf("starting moving head\n");
+	pnp_hhold();
 	for (i = 0; i < 1; i++) {
 		pnp_move(&pnp.motor_h1, 10000000);
 		pnp_move(&pnp.motor_h2, 10000000);
@@ -1088,6 +1198,7 @@ pnp_test_heads(void)
 		pnp_move(&pnp.motor_h2, 0);
 		mdx_usleep(500000);
 	}
+	pnp_hforce(0);
 	printf("head moving done\n");
 }
 

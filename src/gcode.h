@@ -60,7 +60,8 @@ struct gcode_command {
 #define	PNP_ACT_LED_TOP		6
 #define	PNP_ACT_LED_BOTTOM	7
 #define	PNP_ACT_VIBRATOR	8
-#define	PNP_ACT_NTARGETS	9
+#define	PNP_ACT_HPOWER		9
+#define	PNP_ACT_NTARGETS	10
 	int actuate_value[PNP_ACT_NTARGETS];
 
 	/* 'Q': switch on, wait, switch off. Vibrator only. */

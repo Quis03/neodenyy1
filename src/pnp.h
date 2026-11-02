@@ -37,6 +37,10 @@ int pnp_main(void);
 int pnp_command_move(struct gcode_command *cmd);
 int pnp_home_all(void);
 int pnp_report_position(void);
-void pnp_henable(int enable);
+
+/* Nozzle rotation driver power, both heads at once. */
+void pnp_hvacuum(int nozzle, int on);
+void pnp_hforce(int on);
+void pnp_htick(int ms);
 
 #endif /* !_SRC_PNP_H_ */

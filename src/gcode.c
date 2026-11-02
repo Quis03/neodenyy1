@@ -129,6 +129,23 @@ gcode_actuate_needle(int val)
 	return (0);
 }
 
+/*
+ * Power the nozzle rotation drivers while a valve is open: called with
+ * on = 1 before the valves are driven and on = 0 after.
+ */
+static void
+gcode_actuate_hvacuum(struct gcode_command *cmd, int on)
+{
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_AVAC1) &&
+	    cmd->actuate_value[PNP_ACT_AVAC1] == on)
+		pnp_hvacuum(1, on);
+
+	if (cmd->actuate_mask & (1 << PNP_ACT_AVAC2) &&
+	    cmd->actuate_value[PNP_ACT_AVAC2] == on)
+		pnp_hvacuum(2, on);
+}
+
 static int
 gcode_command_actuate(struct gcode_command *cmd)
 {
@@ -136,6 +153,8 @@ gcode_command_actuate(struct gcode_command *cmd)
 	int val;
 
 	error = 0;
+
+	gcode_actuate_hvacuum(cmd, 1);
 
 	if (cmd->actuate_mask & (1 << PNP_ACT_PUMP)) {
 		pin_set(&gpio_sc, PORT_B, 13,
@@ -154,6 +173,8 @@ gcode_command_actuate(struct gcode_command *cmd)
 		    cmd->actuate_value[PNP_ACT_AVAC2]);
 		mdx_usleep(250000);
 	}
+
+	gcode_actuate_hvacuum(cmd, 0);
 
 	if (cmd->actuate_mask & (1 << PNP_ACT_NEEDLE)) {
 		error = gcode_actuate_needle(cmd->actuate_value[
@@ -184,6 +205,10 @@ gcode_command_actuate(struct gcode_command *cmd)
 	if (cmd->actuate_mask & (1 << PNP_ACT_LED_BOTTOM))
 		pin_set(&gpio_sc, PORT_C, 10,
 		    cmd->actuate_value[PNP_ACT_LED_BOTTOM]);
+
+	/* After the valves, so that E wins. */
+	if (cmd->actuate_mask & (1 << PNP_ACT_HPOWER))
+		pnp_hforce(cmd->actuate_value[PNP_ACT_HPOWER]);
 
 	if (cmd->actuate_mask & (1 << PNP_ACT_VIBRATOR)) {
 		val = cmd->actuate_value[PNP_ACT_VIBRATOR];
@@ -355,6 +380,10 @@ gcode_command(char *line, int len)
 			/* Vibrator (stick / bulk feeder). */
 			gcode_set_actuator(&cmd, PNP_ACT_VIBRATOR, value);
 			break;
+		case 'E':
+			/* Nozzle rotation driver power. */
+			gcode_set_actuator(&cmd, PNP_ACT_HPOWER, value);
+			break;
 		case 'Q':
 			/* Actuation length, milliseconds. */
 			cmd.duration_ms = gcode_clamp(value, 0.0f,
@@ -486,6 +515,7 @@ gcode_mainloop(void)
 		}
 
 		mdx_usleep(10000);
+		pnp_htick(10);
 	}
 
 	return (0);

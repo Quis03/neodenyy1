@@ -2,14 +2,21 @@
 
 This is a conversion kit for your YY1 to make it OpenPnP-compatible.
 
+This fork of [mdepx/neodenyy1](https://github.com/mdepx/neodenyy1) adds homing on
+`G28`, feed rate control, error reporting, more actuators (peel banks, LED rings,
+vibrator) and power management for the nozzle rotation drivers. See
+[SETUP.md](SETUP.md) for the first power-up and the OpenPnP configuration.
+
 Project status: working, managed to assemble a few boards with no issues.
 
 | part              | status  |  notes |
 | ----------------- | ------- | ------ |
-| Motion controller | functional              | gcode parts needed for speed control and homing     |
+| Motion controller | functional              | `G28` homing, `F` speed control and error reporting; motion is per axis, not coordinated |
 | Vision            | functional              | openpnp's vision pipeline needs tuning |
-| LED ring bottom   | prototyping in progress | |
-| LED ring top      | prototyping in progress | |
+| LED ring bottom   | firmware done, HW prototyping in progress | on/off only |
+| LED ring top      | firmware done, HW prototyping in progress | on/off only |
+| Nozzle changer    | no firmware needed      | mechanical rack, an OpenPnP nozzle tip changer sequence |
+| Vibrator          | functional              | `M800 S`, for stick / bulk feeders |
 
 Note that the information below is not complete, I am keep updating it.
 
@@ -53,7 +60,7 @@ I use [OpenOCD fork from RPI](https://github.com/raspberrypi/openocd.git).
 
 ### Build this firmware under Linux/FreeBSD
     $ export CROSS_COMPILE=arm-none-eabi-
-    $ git clone --recursive https://github.com/mdepx/neodenyy1
+    $ git clone --recursive https://github.com/Quis03/neodenyy1
     $ cd neodenyy1
     $ make
 
@@ -77,8 +84,70 @@ Replace tcl path to your openocd installation directory
 
 ### Operation
 
-Note that by default the firmware will home the machine on startup. Homing button in the OpenPnP is not implemented (yet).
+The firmware homes the machine on startup, and `G28` homes it again on demand. If
+homing fails the board still enters the GCode loop, and moves are refused with
+`error: machine not homed` until a `G28` succeeds.
+
 Note that this firmware converts linear motion of Z coordinate into rotational. When you setup Z axis in the OpenPnP use ReferenceControllerAxis (linear motion).
+
+### GCode interface
+
+The console is the main display UART, 115200 8N1. Lines end with LF (CRLF is
+accepted), `;` starts a comment, and lines longer than 256 characters are rejected.
+
+| command | action |
+| ------- | ------ |
+| `G0 X Y Z I J F` | linear move; `I` / `J` are the nozzle rotations, `F` is mm/min |
+| `G28` | home every axis |
+| `M114` | position, replies `ok X:.. Y:.. Z:.. I:.. J:..` |
+| `M105 N1` / `M105 N2` | part on nozzle 1 / 2, replies `ok V:<0/1>` / `ok W:<0/1>` |
+| `M800 <target><0/1> ...` | actuators, several targets per line allowed |
+
+| `M800` target | actuator | pin |
+| ------------- | -------- | --- |
+| `P` | pump | PB13 |
+| `V` | vacuum valve, nozzle 1 | PE2 |
+| `W` | vacuum valve, nozzle 2 | PE1 |
+| `D` | needle | PE0 |
+| `L` | peel, left bank | PB12 |
+| `R` | peel, right bank | PB11 |
+| `S` | vibrator, `Q<ms>` switches it off again after that time | PA3 |
+| `T` | top (down-looking) camera LED ring | PD5 |
+| `B` | bottom (up-looking) camera LED ring | PC10 |
+| `E` | nozzle rotation driver power, see below | PD12, PD3, PA15 |
+
+Every command answers `COMPLETE` on success, or a single `error: <text>` line and no
+`COMPLETE` on failure. A multi axis `G0` is range checked on every axis before any of
+them moves.
+
+`F` is applied per axis, so a diagonal is not a straight line and the vector speed
+can be up to sqrt(2) times `F`. Without `F` a move runs at about 14000 mm/min on X
+and Y. `F` is ignored for `I` and `J`.
+
+#### Nozzle rotation power
+
+Left energised, the nozzle rotation drivers overheat the head, so they are only
+powered while one of these holds:
+
+ - a vacuum valve is open (`M800 V1` / `W1`),
+ - a rotation was commanded (`G0 I` / `J`), until `G28`, `M800 E0` or one minute of
+   idle console,
+ - `M800 E1` was sent, until `M800 E0` or five minutes of idle console.
+
+`E1` is what keeps the angle while the nozzle is still down on a part after the valve
+closed. The OpenPnP scripts in [openpnp/scripts](openpnp/scripts) send it before
+every place and release it once both nozzles are free.
+
+The rotations have no home switch, so an angle lost while the drivers are off is
+never recovered. If the shafts do not keep their angle across a power cycle on your
+machine, hold `M800 E1` for the whole job instead.
+
+### LED rings
+
+The LED outputs are push-pull GPIOs, active high and low at reset. Do not drive a
+ring straight off the pin: use it as the gate of a low-side N-channel MOSFET and feed
+the ring from the machine supply. There is no PWM on PC10 or PD5, so brightness is
+set in hardware.
 
 ### Camera modules
 
